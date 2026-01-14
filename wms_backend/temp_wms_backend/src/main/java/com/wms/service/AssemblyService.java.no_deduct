@@ -1,0 +1,75 @@
+package com.wms.service;
+
+import com.wms.entity.*;
+import com.wms.repository.*;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import java.util.List;
+
+@Service
+public class AssemblyService {
+
+    @Autowired
+    private AssemblyRecordRepository recordRepository;
+
+    @Autowired
+    private AssemblyRuleRepository ruleRepository;
+
+    @Autowired
+    private InventoryItemRepository inventoryRepository;
+    
+    @Autowired
+    private FinishedProductService finishedProductService;
+
+    /**
+     * 执行装配：保存记录并自动入库到成品仓库
+     */
+    @Transactional
+    public AssemblyRecord executeAssembly(AssemblyRecord record) {
+        System.out.println("=== 开始装配 ===");
+        System.out.println("产品: " + record.getProductName());
+        System.out.println("数量: " + record.getQuantity());
+        
+        // 验证组装规则存在
+        AssemblyRule rule = ruleRepository.findById(record.getAssemblyRuleId()).orElse(null);
+        if (rule == null || !rule.getIsEnabled()) {
+            throw new RuntimeException("组装规则不存在或已禁用");
+        }
+
+        // 保存装配记录
+        record.setStatus("completed");
+        AssemblyRecord savedRecord = recordRepository.save(record);
+        System.out.println("✓ 装配记录已保存 ID: " + savedRecord.getId());
+        
+        // 自动入库到成品仓库
+        try {
+            finishedProductService.createOrUpdate(
+                record.getProductName(),
+                record.getSpecification(),
+                record.getMaterial(),
+                record.getConnectionType(),
+                record.getQuantity(),
+                savedRecord.getId()
+            );
+            System.out.println("✓ 成品已入库");
+        } catch (Exception e) {
+            System.err.println("⚠️ 成品入库失败: " + e.getMessage());
+            // 不抛出异常，允许装配继续（成品入库失败不影响装配记录）
+        }
+        
+        return savedRecord;
+    }
+
+    public List<AssemblyRecord> findAll() {
+        return recordRepository.findAll();
+    }
+
+    public AssemblyRecord findById(Long id) {
+        return recordRepository.findById(id).orElse(null);
+    }
+
+    public void deleteById(Long id) {
+        recordRepository.deleteById(id);
+    }
+}

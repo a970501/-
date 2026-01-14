@@ -1,0 +1,51 @@
+package com.wms.service;
+
+import com.wms.entity.*;
+import com.wms.repository.*;
+import org.springframework.beans.factory.annotation.Autowired;  
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import java.util.List;
+
+@Service
+public class AssemblyService {
+    
+    @Autowired
+    private AssemblyRecordRepository recordRepository;
+
+    @Autowired
+    private AssemblyRuleRepository ruleRepository;
+
+    @Autowired
+    private InventoryItemRepository inventoryRepository;
+
+    /**
+     * 保存装配记录（仅保存记录，不扣库存）
+     * 注意：库存扣减和成品入库已由前端完成，后端只负责保存记录
+     */
+    @Transactional
+    public AssemblyRecord executeAssembly(AssemblyRecord record) {
+        // 验证组装规则存在
+        AssemblyRule rule = ruleRepository.findById(record.getAssemblyRuleId()).orElse(null);
+        if (rule == null || !rule.getIsEnabled()) {
+            throw new RuntimeException("组装规则不存在或已禁用");
+        }
+
+        // 直接保存装配记录（库存操作已由前端完成）
+        record.setStatus("completed");
+        return recordRepository.save(record);
+    }
+
+    public List<AssemblyRecord> findAll() {
+        return recordRepository.findAll();
+    }
+
+    public AssemblyRecord findById(Long id) {
+        return recordRepository.findById(id).orElse(null);
+    }
+
+    public void deleteById(Long id) {
+        recordRepository.deleteById(id);
+    }
+}
+

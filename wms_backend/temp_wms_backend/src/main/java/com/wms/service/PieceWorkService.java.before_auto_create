@@ -1,0 +1,205 @@
+package com.wms.service;
+
+import com.wms.entity.*;
+import com.wms.repository.*;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import java.util.List;
+import java.util.Optional;
+
+@Service
+public class PieceWorkService {
+
+    @Autowired
+    private PieceWorkRepository pieceWorkRepository;
+
+    @Autowired
+    private InventoryItemRepository inventoryRepository;
+
+    @Autowired
+    private AutoStorageRuleRepository ruleRepository;
+
+    @Autowired
+    private PriceTableRepository priceTableRepository;
+
+    @Autowired
+    private BlankInventoryRepository blankInventoryRepository;
+
+    @Transactional
+    public PieceWork create(PieceWork pieceWork, String userRole) {
+        System.out.println("==========================================");
+        System.out.println("计件录入 - userRole: [" + userRole + "]");
+        System.out.println("工人: " + pieceWork.getWorkerName());
+        System.out.println("产品: " + pieceWork.getProductName());
+        System.out.println("数量: " + pieceWork.getQuantity());
+        System.out.println("废品数量: " + pieceWork.getDefectQuantity());
+        System.out.println("半成品: " + pieceWork.getSemiFinished());
+        System.out.println("==========================================");
+
+        // 1. 自动填充单价
+        if (pieceWork.getUnitPrice() == null) {
+            List<PriceTable> prices = priceTableRepository.findByProductNameAndIsActive(
+                pieceWork.getProductName(), true);
+            if (!prices.isEmpty()) {
+                pieceWork.setUnitPrice(prices.get(0).getUnitPrice());
+            }
+        }
+
+        // 2. 保存计件记录
+        PieceWork saved = pieceWorkRepository.save(pieceWork);
+
+        // 3. 管理员不执行自动入库和毛坯扣除
+        if ("ADMIN".equals(userRole)) {
+            System.out.println(">>> 管理员录入，跳过自动入库和毛坯扣除");
+            return saved;
+        }
+
+        // 4. 只有半成品才自动入库
+        if (!"是".equals(pieceWork.getSemiFinished())) {
+            System.out.println(">>> 非半成品，跳过自动入库");
+            return saved;
+        }
+
+        System.out.println(">>> 普通用户 + 半成品，执行自动入库");
+
+        // 5. 查找匹配的自动入库规则
+        List<AutoStorageRule> enabledRules = ruleRepository.findByIsEnabledOrderByPriorityDesc(true);
+        AutoStorageRule rule = enabledRules.stream()
+            .filter(r -> {
+                String pattern = r.getProductPattern();
+                if (pattern == null) return false;
+                String regex = pattern.replace("%", ".*");
+                return pieceWork.getProductName() != null &&
+                       pieceWork.getProductName().matches(regex);
+            })
+            .findFirst()
+            .orElse(null);
+
+        if (rule != null && rule.getIsEnabled()) {
+            System.out.println("=== 匹配规则: " + rule.getRuleName() + " ===");
+
+            int quantity = pieceWork.getQuantity();
+            int defectQty = pieceWork.getDefectQuantity() != null ? pieceWork.getDefectQuantity() : 0;
+
+            System.out.println("录入数量: " + quantity);
+            System.out.println("废品数量: " + defectQty + " (单独统计，不影响入库)");
+
+            // 6. 消耗毛坯（按总消耗数量（合格品+废品））
+            if (Boolean.TRUE.equals(rule.getIsFinishedProduct())
+                && rule.getBlankProductName() != null
+                && !rule.getBlankProductName().trim().isEmpty()) {
+                int totalConsumption = quantity + defectQty; // 总消耗 = 合格品 + 废品
+                consumeBlank(rule, pieceWork, totalConsumption);
+            }
+
+            // 7. 成品入库（入库数量 = 录入数量，废品单独统计不影响入库）
+            createOrUpdateInventory(rule.getTargetLocation(), pieceWork, quantity);
+
+        } else {
+            System.out.println("未找到匹配规则: " + pieceWork.getProductName());
+        }
+
+        return saved;
+    }
+
+    /**
+     * 创建或更新库存
+     */
+    private void createOrUpdateInventory(String targetLocation, PieceWork pieceWork, int quantity) {
+        List<InventoryItem> existingItems = inventoryRepository.findAll();
+        InventoryItem existingItem = existingItems.stream()
+            .filter(i -> targetLocation.equals(i.getProductName())
+                && matchesSpecification(pieceWork.getSpecification(), i.getSpecification())
+                && matchesMaterial(pieceWork.getMaterial(), i.getMaterial()))
+            .findFirst()
+            .orElse(null);
+
+        if (existingItem != null) {
+            existingItem.setQuantity(existingItem.getQuantity() + quantity);
+            inventoryRepository.save(existingItem);
+            System.out.println("更新库存: " + targetLocation + ", 新数量: " + existingItem.getQuantity());
+        } else {
+            InventoryItem item = new InventoryItem();
+            item.setProductName(targetLocation);
+            item.setSpecification(pieceWork.getSpecification());
+            item.setQuantity(quantity);
+            item.setMaterial(pieceWork.getMaterial());
+            item.setConnectionType(pieceWork.getConnectionType());
+            item.setUnit(pieceWork.getUnit());
+            item.setUnitPrice(pieceWork.getUnitPrice());
+            InventoryItem savedItem = inventoryRepository.save(item);
+            System.out.println("创建库存: " + targetLocation + ", 数量: " + savedItem.getQuantity());
+        }
+    }
+
+    /**
+     * 消耗毛坯库存
+     */
+    private void consumeBlank(AutoStorageRule rule, PieceWork pieceWork, int quantity) {
+        System.out.println("=== 消耗毛坯 ===");
+        System.out.println("毛坯产品: " + rule.getBlankProductName());
+
+        int requiredBlankQty = quantity * rule.getBlankQuantityPerUnit();
+        System.out.println("需要毛坯: " + requiredBlankQty);
+
+        Optional<BlankInventory> blankItemOpt = blankInventoryRepository
+            .findByProductNameAndSpecificationAndMaterial(
+                rule.getBlankProductName(),
+                pieceWork.getSpecification(),
+                pieceWork.getMaterial()
+            );
+
+        if (!blankItemOpt.isPresent()) {
+            System.out.println("⚠️ 未找到毛坯库存，继续入库");
+        if (!blankItemOpt.isPresent()) {
+            System.out.println(" 未找到毛坯库存，自动创建);
+ BlankInventory newBlank = new BlankInventory();
+ newBlank.setProductName(rule.getBlankProductName());
+ newBlank.setSpecification(pieceWork.getSpecification());
+ newBlank.setMaterial(pieceWork.getMaterial());
+ newBlank.setQuantity(0);
+ newBlank.setUnit(个);
+ newBlank.setRemarks(自动创建-计件扣除);
+ blankItem = blankInventoryRepository.save(newBlank);
+ System.out.println(" 已创建毛坯库存 ID:  + blankItem.getId());
+        } else {
+            blankItem = blankItemOpt.get();
+        }
+            return;
+        }
+
+        int newQuantity = blankItem.getQuantity() - requiredBlankQty;
+        blankItem.setQuantity(newQuantity);
+        blankInventoryRepository.save(blankItem);
+        System.out.println("✓ 毛坯扣除成功，剩余: " + newQuantity);
+    }
+
+    private boolean matchesSpecification(String spec1, String spec2) {
+        if (spec1 == null && spec2 == null) return true;
+        if (spec1 == null || spec2 == null) return false;
+        return spec1.equals(spec2);
+    }
+
+    private boolean matchesMaterial(String mat1, String mat2) {
+        if (mat1 == null && mat2 == null) return true;
+        if (mat1 == null || mat2 == null) return false;
+        return mat1.equals(mat2);
+    }
+
+    public List<PieceWork> findAll() {
+        return pieceWorkRepository.findAll();
+    }
+
+    public PieceWork findById(Long id) {
+        return pieceWorkRepository.findById(id).orElse(null);
+    }
+
+    public void deleteById(Long id) {
+        pieceWorkRepository.deleteById(id);
+    }
+
+    public List<PieceWork> findByWorkerName(String workerName) {
+        return pieceWorkRepository.findByWorkerName(workerName);
+    }
+}
